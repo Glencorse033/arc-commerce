@@ -28,6 +28,7 @@ import {
 import { ConnectWalletButton } from "@/components/wallet/connect-wallet-button";
 import { NetworkIndicator } from "@/components/wallet/network-indicator";
 import { UsdcBalance } from "@/components/wallet/usdc-balance";
+import { CircleWalletBalance } from "@/components/wallet/circle-wallet-balance";
 import { Separator } from "@/components/ui/separator";
 
 export function WalletStatusCard() {
@@ -51,7 +52,11 @@ export function WalletStatusCard() {
           </div>
           <Separator />
           <div className="flex justify-between items-center">
-            <span className="text-muted-foreground">USDC Balance</span>
+            <span className="text-muted-foreground">Circle Balance</span>
+            <CircleWalletBalance />
+          </div>
+          <div className="flex justify-between items-center">
+            <span className="text-muted-foreground">MetaMask Balance</span>
             <UsdcBalance />
           </div>
         </div>

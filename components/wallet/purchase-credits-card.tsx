@@ -41,16 +41,20 @@ import { TransactionConfirmationModal } from "@/components/wallet/transaction-co
 const USDC_PER_CREDIT = 1;
 const presetUsdcAmounts = [10, 25, 50, 100];
 
+type WalletType = "external" | "circle";
+
 export function PurchaseCreditsCard() {
-  const { address, isConnected } = useAccount();
+  const { address: externalAddress, isConnected: isExternalConnected } = useAccount();
   const chainId = useChainId();
   const {
     usdcAddress,
-    balance,
-    hasBalance,
-    isLoading: isBalanceLoading,
+    balance: externalBalance,
+    hasBalance: hasExternalBalance,
+    isLoading: isExternalBalanceLoading,
   } = useUsdcBalance();
   const { writeContractAsync } = useWriteContract();
+
+  const [walletType, setWalletType] = useState<WalletType>("external");
   const [creditsToPurchase, setCreditsToPurchase] = useState(10);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [currentTransaction, setCurrentTransaction] = useState<{
@@ -64,6 +68,13 @@ export function PurchaseCreditsCard() {
     fee?: number;
   } | null>(null);
   const [showConfirmation, setShowConfirmation] = useState(false);
+
+  // Circle Wallet States
+  const [circleWallets, setCircleWallets] = useState<any[]>([]);
+  const [selectedCircleWalletId, setSelectedCircleWalletId] = useState<string | null>(null);
+  const [circleBalance, setCircleBalance] = useState<string | null>(null);
+  const [isCircleLoading, setIsCircleLoading] = useState(false);
+
   // State to hold the fetched destination address and its loading status
   const [destination, setDestination] = useState<`0x${string}` | undefined>();
   const [isLoadingDestination, setIsLoadingDestination] = useState(true);
@@ -93,8 +104,47 @@ export function PurchaseCreditsCard() {
       }
     }
 
+    async function fetchCircleWallets() {
+      try {
+        setIsCircleLoading(true);
+        const response = await fetch('/api/user-wallets');
+        const data = await response.json();
+        if (response.ok && data.wallets?.length > 0) {
+          setCircleWallets(data.wallets);
+          // Auto-select the first SCA wallet if available (case-insensitive)
+          const scaWallet = data.wallets.find((w: any) => w.type?.toLowerCase() === 'sca') || data.wallets[0];
+          setSelectedCircleWalletId(scaWallet.circle_wallet_id);
+          setWalletType("circle"); // Default to Circle if one exists
+        }
+      } catch (error) {
+        console.error("Failed to fetch Circle wallets:", error);
+      } finally {
+        setIsCircleLoading(false);
+      }
+    }
+
     fetchDestinationWallet();
+    fetchCircleWallets();
   }, []);
+
+  // Fetch balance when selected Circle wallet changes
+  useEffect(() => {
+    async function fetchBalance() {
+      if (!selectedCircleWalletId) return;
+      try {
+        const response = await fetch(`/api/circle/balance?walletId=${selectedCircleWalletId}`);
+        const data = await response.json();
+        if (response.ok) {
+          setCircleBalance(data.balance);
+        }
+      } catch (error) {
+        console.error("Failed to fetch Circle balance:", error);
+      }
+    }
+    if (walletType === "circle") {
+      fetchBalance();
+    }
+  }, [selectedCircleWalletId, walletType]);
 
   const requiredUsdc = creditsToPurchase * USDC_PER_CREDIT;
   const requiredUsdcMicro = useMemo(() => {
@@ -103,22 +153,29 @@ export function PurchaseCreditsCard() {
     return BigInt(micro);
   }, [requiredUsdc]);
 
-  const hasSufficientBalance =
-    hasBalance && balance !== null
-      ? balance >= requiredUsdcMicro
-      : false;
+  const hasSufficientBalance = useMemo(() => {
+    if (walletType === "external") {
+      return hasExternalBalance && externalBalance !== null
+        ? externalBalance >= requiredUsdcMicro
+        : false;
+    } else {
+      return circleBalance ? parseFloat(circleBalance) >= requiredUsdc : false;
+    }
+  }, [walletType, hasExternalBalance, externalBalance, circleBalance, requiredUsdc, requiredUsdcMicro]);
+
+  const isConnected = walletType === "external" ? isExternalConnected : !!selectedCircleWalletId;
 
   const buttonDisabled =
     !isConnected ||
     !hasSufficientBalance ||
     creditsToPurchase <= 0 ||
     !destination ||
-    !usdcAddress ||
+    (walletType === "external" && !usdcAddress) ||
     isSubmitting ||
-    isBalanceLoading;
+    (walletType === "external" && isExternalBalanceLoading);
 
-  async function handlePurchase() {
-    if (!isConnected || !address) {
+  async function handleExternalPurchase() {
+    if (!isExternalConnected || !externalAddress) {
       toast.error("Not connected", {
         description: "Connect your wallet first.",
       });
@@ -133,12 +190,6 @@ export function PurchaseCreditsCard() {
     if (!usdcAddress) {
       toast.error("Unsupported network", {
         description: "USDC not supported on current chain.",
-      });
-      return;
-    }
-    if (!hasSufficientBalance) {
-      toast.error("Insufficient balance", {
-        description: "Your USDC balance is too low for this purchase.",
       });
       return;
     }
@@ -157,19 +208,17 @@ export function PurchaseCreditsCard() {
         description: `Hash: ${txHash.slice(0, 10)}...`,
       });
 
-      // Persist (fire-and-forget with basic handling)
+      // Persist
       const res = await fetch("/api/transactions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           credits: creditsToPurchase,
-          usdcAmount:
-            Number((requiredUsdcMicro / 1_000_000n).toString()) +
-            Number(requiredUsdcMicro % 1_000_000n) / 1_000_000,
+          usdcAmount: requiredUsdc,
           txHash,
           chainId,
-          walletAddress: address,
-          destinationAddress: destination, // Include admin wallet destination
+          walletAddress: externalAddress,
+          destinationAddress: destination,
         }),
       });
 
@@ -180,35 +229,63 @@ export function PurchaseCreditsCard() {
         });
       } else {
         const responseData = await res.json();
-
-        // Create transaction object for confirmation modal
-        const transaction = {
-          id: responseData.transactionId || txHash, // Fallback to txHash if no ID returned
+        setCurrentTransaction({
+          id: responseData.transactionId || txHash,
           credits: creditsToPurchase,
-          usdcAmount: Number((requiredUsdcMicro / 1_000_000n).toString()) +
-            Number(requiredUsdcMicro % 1_000_000n) / 1_000_000,
+          usdcAmount: requiredUsdc,
           txHash,
           chainId,
-          status: "pending" as const,
+          status: "pending",
           createdAt: new Date().toISOString(),
-          fee: 0, // Network fees are handled separately
-        };
-
-        setCurrentTransaction(transaction);
-        setShowConfirmation(true);
-
-        toast.success("Transaction recorded", {
-          description: "Monitoring for confirmation...",
         });
+        setShowConfirmation(true);
       }
     } catch (err) {
-      const message =
-        err instanceof BaseError
-          ? err.shortMessage
-          : "Transaction failed unexpectedly.";
-      toast.error("Transaction error", {
-        description: message,
+      const message = err instanceof BaseError ? err.shortMessage : "Transaction failed unexpectedly.";
+      toast.error("Transaction error", { description: message });
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function handleCirclePurchase() {
+    if (!selectedCircleWalletId) {
+      toast.error("No Circle wallet selected");
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const response = await fetch('/api/circle/payment', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          credits: creditsToPurchase,
+          usdcAmount: requiredUsdc,
+        }),
       });
+
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to process Circle payment");
+      }
+
+      toast.success("Circle payment initiated!", {
+        description: "Your credits will be added once the transaction is confirmed.",
+      });
+
+      setCurrentTransaction({
+        id: data.transactionId,
+        credits: creditsToPurchase,
+        usdcAmount: requiredUsdc,
+        txHash: "pending",
+        chainId: chainId,
+        status: "pending",
+        createdAt: new Date().toISOString(),
+      });
+      setShowConfirmation(true);
+    } catch (error: any) {
+      toast.error("Payment failed", { description: error.message });
     } finally {
       setIsSubmitting(false);
     }
@@ -217,7 +294,6 @@ export function PurchaseCreditsCard() {
   const handleRetry = () => {
     setShowConfirmation(false);
     setCurrentTransaction(null);
-    // The user can click the purchase button again to retry
   };
 
   const handleCloseConfirmation = () => {
@@ -229,10 +305,32 @@ export function PurchaseCreditsCard() {
     <>
       <Card>
         <CardHeader>
-          <CardTitle>Purchase Credits</CardTitle>
-          <CardDescription>
-            Top up your account balance using USDC.
-          </CardDescription>
+          <div className="flex justify-between items-start">
+            <div>
+              <CardTitle>Purchase Credits</CardTitle>
+              <CardDescription>
+                Top up your account balance using USDC.
+              </CardDescription>
+            </div>
+            {circleWallets.length > 0 && (
+              <div className="flex bg-muted p-1 rounded-md text-xs">
+                <button
+                  className={`px-2 py-1 rounded-sm transition-colors ${walletType === "external" ? "bg-background shadow-sm" : "hover:bg-background/50"
+                    }`}
+                  onClick={() => setWalletType("external")}
+                >
+                  MetaMask
+                </button>
+                <button
+                  className={`px-2 py-1 rounded-sm transition-colors ${walletType === "circle" ? "bg-background shadow-sm" : "hover:bg-background/50"
+                    }`}
+                  onClick={() => setWalletType("circle")}
+                >
+                  Circle Wallet
+                </button>
+              </div>
+            )}
+          </div>
         </CardHeader>
         <CardContent className="space-y-4 pb-4">
           <div className="space-y-2">
@@ -245,14 +343,12 @@ export function PurchaseCreditsCard() {
                 setCreditsToPurchase(Math.max(0, Number(e.target.value)))
               }
               min="1"
-              disabled={!isConnected || isSubmitting}
+              disabled={isSubmitting}
             />
           </div>
 
           <div className="grid grid-cols-4 gap-2">
             {presetUsdcAmounts.map((amount) => {
-              // The logic here updates automatically with the new conversion rate.
-              // e.g., $10 button now sets credits to 10.
               const credits = amount / USDC_PER_CREDIT;
               const isActive = creditsToPurchase === credits;
               return (
@@ -260,7 +356,7 @@ export function PurchaseCreditsCard() {
                   key={amount}
                   variant={isActive ? "secondary" : "outline"}
                   onClick={() => setCreditsToPurchase(credits)}
-                  disabled={!isConnected || isSubmitting}
+                  disabled={isSubmitting}
                 >
                   ${amount}
                 </Button>
@@ -279,22 +375,43 @@ export function PurchaseCreditsCard() {
                 USDC
               </span>
             </div>
+
+            {walletType === "circle" ? (
+              <div className="text-center text-xs pt-1">
+                {isCircleLoading ? (
+                  "Loading Circle balance..."
+                ) : circleBalance !== null ? (
+                  <>
+                    Balance: <span className="font-semibold">{parseFloat(circleBalance).toFixed(2)} USDC</span>
+                    {parseFloat(circleBalance) < requiredUsdc && (
+                      <div className="text-amber-600">Insufficient Circle wallet balance.</div>
+                    )}
+                  </>
+                ) : (
+                  <div className="text-amber-600">Could not load Circle wallet balance.</div>
+                )}
+              </div>
+            ) : (
+              <>
+                {!hasSufficientBalance && isExternalConnected && !isExternalBalanceLoading && (
+                  <div className="text-amber-600 text-center pt-2">
+                    Insufficient MetaMask balance.
+                  </div>
+                )}
+              </>
+            )}
+
             {isLoadingDestination && (
               <div className="text-red-500 text-center pt-2">
                 Destination address not configured.
-              </div>
-            )}
-            {!hasSufficientBalance && isConnected && !isBalanceLoading && (
-              <div className="text-amber-600 text-center pt-2">
-                Insufficient USDC balance.
               </div>
             )}
           </div>
         </CardContent>
         <CardFooter className="flex flex-col items-center gap-3">
           <Button
-            className="w-full gap-1"
-            onClick={handlePurchase}
+            className="w-full gap-2"
+            onClick={walletType === "external" ? handleExternalPurchase : handleCirclePurchase}
             disabled={buttonDisabled}
           >
             <Image
@@ -303,7 +420,7 @@ export function PurchaseCreditsCard() {
               width={20}
               height={20}
             />
-            {isSubmitting ? "Submitting..." : "Pay with USDC"}
+            {isSubmitting ? "Processing..." : `Pay with ${walletType === "external" ? "MetaMask" : "Circle Wallet"}`}
           </Button>
           <div className="flex items-center gap-2">
             <p className="text-xs text-muted-foreground">
